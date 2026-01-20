@@ -10,6 +10,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
@@ -17,7 +18,6 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.graphics.Color
 import kotlin.math.roundToInt
 
 @Composable
@@ -29,7 +29,9 @@ fun VirtualKeyboard(
     clickPulse: Long,
     pad: Float,
     ipd: Float,
-    onText: (String) -> Unit,
+    zoom: Float,
+    srcW: Int = 0,
+    srcH: Int = 0,
     onKeyTap: (String) -> Unit,
     onClose: () -> Unit
 ) {
@@ -37,15 +39,36 @@ fun VirtualKeyboard(
     var lastConsumedPulse by remember { mutableStateOf(0L) }
 
     var vkWindowRect by remember { mutableStateOf<Rect?>(null) }
-
     val density = LocalDensity.current
-    val hitSlopPx = with(density) { 22.dp.toPx() }
+    val hitSlopPx = with(density) { 12.dp.toPx() } // ✅ 과도한 겹침 방지(22dp -> 12dp)
 
     fun hit(rect: Rect, p: Offset): Boolean {
         return p.x >= rect.left - hitSlopPx &&
                 p.x <= rect.right + hitSlopPx &&
                 p.y >= rect.top - hitSlopPx &&
                 p.y <= rect.bottom + hitSlopPx
+    }
+
+    fun bestHit(prefix: String, point: Offset): String? {
+        var bestId: String? = null
+        var bestD = Float.POSITIVE_INFINITY
+
+        for ((id, rect) in boundsMap) {
+            if (!id.startsWith(prefix)) continue
+            if (!hit(rect, point)) continue
+
+            val cx = (rect.left + rect.right) * 0.5f
+            val cy = (rect.top + rect.bottom) * 0.5f
+            val dx = point.x - cx
+            val dy = point.y - cy
+            val d = dx * dx + dy * dy
+
+            if (d < bestD) {
+                bestD = d
+                bestId = id
+            }
+        }
+        return bestId
     }
 
     BoxWithConstraints(
@@ -56,38 +79,49 @@ fun VirtualKeyboard(
         val rootW = with(density) { maxWidth.toPx() }
         val rootH = with(density) { maxHeight.toPx() }
 
-        val win = vkWindowRect
+        val baseLeft = vkWindowRect?.left ?: 0f
+        val baseTop = vkWindowRect?.top ?: 0f
 
-        // ✅ 중요: hoveredKey는 remember/derivedState로 "캡처"하면 고정될 수 있음
-        // -> 매 리컴포지션마다 계산
-        val hoveredKey: String? = run {
-            if (!tracking) return@run null
-            val wRect = win ?: return@run null
+        val padPx = pad.coerceIn(0f, 0.2f) * rootW
+        val availPx = (rootW - 2f * padPx).coerceAtLeast(1f)
+        val eyePx = availPx / 2f
 
-            val baseLeft = wRect.left
-            val baseTop = wRect.top
+        val px = pointerX.coerceIn(0f, 1f)
+        val py = pointerY.coerceIn(0f, 1f)
 
-            val padPx = pad.coerceIn(0f, 0.2f) * rootW
-            val availPx = (rootW - 2f * padPx).coerceAtLeast(1f)
-            val eyePx = availPx / 2f
-            val ipdShiftPx = ipd * rootW
+        val leftStart = padPx
+        val rightStart = padPx + eyePx
 
-            val px = pointerX.coerceIn(0f, 1f)
-            val py = pointerY.coerceIn(0f, 1f)
+        val ipdShiftPx = (ipd * rootW)
 
-            val leftStart = padPx
-            val rightStart = padPx + eyePx
+        // ✅ CardboardStreamView의 mapPoint와 동일(zoom/ipd/clamp)
+        fun mapPoint(eyeStartX: Float, shift: Float): Offset {
+            val ex0 = eyeStartX
+            val ex1 = eyeStartX + eyePx
 
-            val leftXLocal = (leftStart + px * eyePx + ipdShiftPx)
-                .coerceIn(leftStart, leftStart + eyePx)
-            val rightXLocal = (rightStart + px * eyePx - ipdShiftPx)
-                .coerceIn(rightStart, rightStart + eyePx)
+            val cx = eyeStartX + eyePx / 2f
+            val cy = rootH / 2f
 
-            val leftPoint = Offset(baseLeft + leftXLocal, baseTop + py * rootH)
-            val rightPoint = Offset(baseLeft + rightXLocal, baseTop + py * rootH)
+            val rawX = eyeStartX + px * eyePx
+            val rawY = py * rootH
 
-            boundsMap.entries.firstOrNull { it.key.startsWith("L:") && hit(it.value, leftPoint) }?.key
-                ?: boundsMap.entries.firstOrNull { it.key.startsWith("R:") && hit(it.value, rightPoint) }?.key
+            val zx = cx + (rawX - cx) * zoom + shift
+            val zy = cy + (rawY - cy) * zoom
+
+            val fx = zx.coerceIn(ex0, ex1)
+            val fy = zy.coerceIn(0f, rootH)
+
+            return Offset(baseLeft + fx, baseTop + fy)
+        }
+
+        val leftPoint = mapPoint(leftStart, +ipdShiftPx)
+        val rightPoint = mapPoint(rightStart, -ipdShiftPx)
+
+        val hoveredKey: String? = if (!tracking || vkWindowRect == null) {
+            null
+        } else {
+            // ✅ 겹치면 “첫 번째”가 아니라 “가장 가까운 키”
+            bestHit("L:", leftPoint) ?: bestHit("R:", rightPoint)
         }
 
         LaunchedEffect(clickPulse) {
@@ -96,7 +130,7 @@ fun VirtualKeyboard(
             lastConsumedPulse = clickPulse
 
             val key = hoveredKey ?: return@LaunchedEffect
-            performKey(key, onText, onKeyTap, onClose)
+            performKey(key, onKeyTap, onClose)
         }
 
         val padDp = (maxWidth * pad).coerceAtLeast(0.dp)
@@ -110,13 +144,14 @@ fun VirtualKeyboard(
                 .fillMaxWidth()
                 .padding(horizontal = padDp)
                 .padding(bottom = 12.dp)
-                .heightIn(max = 260.dp)
+                .heightIn(max = 280.dp),
+            horizontalArrangement = Arrangement.spacedBy(0.dp)
         ) {
             KeyboardEyePane(
                 eyeTag = "L",
                 hoveredKey = hoveredKey,
                 boundsMap = boundsMap,
-                onKey = { performKey(it, onText, onKeyTap, onClose) },
+                onKey = { performKey(it, onKeyTap, onClose) },
                 modifier = Modifier
                     .width(eyeW)
                     .fillMaxHeight()
@@ -126,7 +161,7 @@ fun VirtualKeyboard(
                 eyeTag = "R",
                 hoveredKey = hoveredKey,
                 boundsMap = boundsMap,
-                onKey = { performKey(it, onText, onKeyTap, onClose) },
+                onKey = { performKey(it, onKeyTap, onClose) },
                 modifier = Modifier
                     .width(eyeW)
                     .fillMaxHeight()
@@ -159,10 +194,12 @@ private fun KeyboardEyePane(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            KeyButton("$eyeTag:CLOSE", "CLOSE", hoveredKey, boundsMap, onKey, Modifier.weight(1.1f))
+            KeyButton("$eyeTag:KOR", "한/영", hoveredKey, boundsMap, onKey, Modifier.weight(1.2f))
+            KeyButton("$eyeTag:CLICK", "CLICK", hoveredKey, boundsMap, onKey, Modifier.weight(1.2f))
             KeyButton("$eyeTag:SPACE", "SPACE", hoveredKey, boundsMap, onKey, Modifier.weight(2.2f))
             KeyButton("$eyeTag:BS", "BS", hoveredKey, boundsMap, onKey, Modifier.weight(1.0f))
             KeyButton("$eyeTag:ENTER", "ENTER", hoveredKey, boundsMap, onKey, Modifier.weight(1.3f))
+            KeyButton("$eyeTag:CLOSE", "CLOSE", hoveredKey, boundsMap, onKey, Modifier.weight(1.0f))
         }
     }
 }
@@ -215,7 +252,6 @@ private fun KeyButton(
 
 private fun performKey(
     id: String,
-    onText: (String) -> Unit,
     onKeyTap: (String) -> Unit,
     onClose: () -> Unit
 ) {
@@ -225,6 +261,8 @@ private fun performKey(
         "SPACE" -> onKeyTap("SPACE")
         "BS" -> onKeyTap("BACKSPACE")
         "ENTER" -> onKeyTap("ENTER")
-        else -> onText(label.lowercase())
+        "CLICK" -> onKeyTap("CLICK")
+        "KOR" -> onKeyTap("KOR_TOGGLE")   // ✅ 의미 명확
+        else -> onKeyTap(label.lowercase())
     }
 }

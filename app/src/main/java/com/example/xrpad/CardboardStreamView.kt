@@ -20,10 +20,16 @@ import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.unit.dp
-import kotlin.math.max
-import kotlin.math.min
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.math.roundToInt
 
 @Composable
@@ -41,93 +47,111 @@ fun CardboardStreamView(
     onZoomChange: (Float) -> Unit,
     onReticleScaleChange: (Float) -> Unit,
     onToggleTuning: () -> Unit,
-    tuningOpen: Boolean,
-    onStreamSize: (Int, Int) -> Unit = { _, _ -> } // ✅ 추가
+    tuningOpen: Boolean
 ) {
     val density = LocalDensity.current
+
+    // MJPEG frames
     val frameBytes by rememberMjpegFrames(streamUrl)
-
-    // ✅ 원본 프레임 크기(비율 계산용)
-    val (srcW, srcH) = remember(frameBytes) {
-        jpegSize(frameBytes) ?: (0 to 0)
+    val bmp = remember(frameBytes) {
+        frameBytes?.let { BitmapFactory.decodeByteArray(it, 0, it.size) }
     }
-
-    // ✅ XRPadApp으로 전달
-    LaunchedEffect(srcW, srcH) {
-        if (srcW > 0 && srcH > 0) onStreamSize(srcW, srcH)
-    }
+    val img = remember(bmp) { bmp?.asImageBitmap() }
 
     BoxWithConstraints(
-        modifier = Modifier.fillMaxSize().background(Color.Black)
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
     ) {
-        val padDp = (maxWidth * pad).coerceAtLeast(0.dp)
+        val padDp = (maxWidth * pad.coerceIn(0f, 0.20f)).coerceAtLeast(0.dp)
         val availW = (maxWidth - padDp * 2).coerceAtLeast(1.dp)
         val eyeW = availW / 2
-        val ipdShiftPx = with(density) { (maxWidth * ipd).toPx() }
 
-        // Stream
+        val wPx = with(density) { maxWidth.toPx() }
+        val ipdShiftPx = (wPx * ipd)
+
+        // 1) Stream (L/R)
         Row(
-            modifier = Modifier.fillMaxSize().padding(horizontal = padDp)
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = padDp)
         ) {
-            EyePane(frameBytes, Modifier.width(eyeW).fillMaxHeight(), zoom, +ipdShiftPx)
-            EyePane(frameBytes, Modifier.width(eyeW).fillMaxHeight(), zoom, -ipdShiftPx)
+            EyePane(
+                img = img,
+                modifier = Modifier
+                    .width(eyeW)
+                    .fillMaxHeight(),
+                zoom = zoom,
+                shiftPx = +ipdShiftPx
+            )
+            EyePane(
+                img = img,
+                modifier = Modifier
+                    .width(eyeW)
+                    .fillMaxHeight(),
+                zoom = zoom,
+                shiftPx = -ipdShiftPx
+            )
         }
 
-        // Reticle: 영상 rect 안에서만
+        // 2) Reticle (zoom/ipd/pad 정합 + eye 밖으로 못 나감)
         Canvas(Modifier.fillMaxSize()) {
             if (!tracking) return@Canvas
 
             val w = size.width
             val h = size.height
-            val padPx = pad * w
+            val padPx = pad.coerceIn(0f, 0.20f) * w
             val availPx = (w - 2f * padPx).coerceAtLeast(1f)
             val eyePx = availPx / 2f
-            val px = pointerX.coerceIn(0f, 1f)
-            val py = pointerY.coerceIn(0f, 1f)
 
             val rPx = with(density) { 4.dp.toPx() } * reticleScale
             val thick = with(density) { 3.dp.toPx() } * reticleScale
             val thin = with(density) { 2.dp.toPx() } * reticleScale
             val arm = with(density) { 10.dp.toPx() } * reticleScale
 
-            fun drawReticle(eyeStartX: Float, shift: Float) {
-                if (srcW <= 0 || srcH <= 0) {
-                    val raw = eyeStartX + px * eyePx + shift
-                    val cx = raw.coerceIn(eyeStartX, eyeStartX + eyePx)
-                    val cy = py * h
-                    drawCrosshair(cx, cy, rPx, thick, thin, arm)
-                    return
-                }
+            fun mapPoint(eyeStartX: Float, shift: Float): Offset {
+                val ex0 = eyeStartX
+                val ex1 = eyeStartX + eyePx
 
-                val fit = min(eyePx / srcW.toFloat(), h / srcH.toFloat())
-                val dispW = srcW * fit * zoom
-                val dispH = srcH * fit * zoom
+                val cx = eyeStartX + eyePx / 2f
+                val cy = h / 2f
 
-                val imgLeft = eyeStartX + (eyePx - dispW) * 0.5f + shift
-                val imgTop = (h - dispH) * 0.5f
-                val imgRight = imgLeft + dispW
-                val imgBottom = imgTop + dispH
+                val rawX = eyeStartX + pointerX.coerceIn(0f, 1f) * eyePx
+                val rawY = pointerY.coerceIn(0f, 1f) * h
 
-                val eyeLeft = eyeStartX
-                val eyeRight = eyeStartX + eyePx
-                val visLeft = max(eyeLeft, imgLeft)
-                val visRight = min(eyeRight, imgRight)
-                val visTop = max(0f, imgTop)
-                val visBottom = min(h, imgBottom)
+                val zx = cx + (rawX - cx) * zoom + shift
+                val zy = cy + (rawY - cy) * zoom
 
-                val cx = (imgLeft + px * dispW).coerceIn(visLeft, visRight)
-                val cy = (imgTop + py * dispH).coerceIn(visTop, visBottom)
+                val fx = zx.coerceIn(ex0, ex1)
+                val fy = zy.coerceIn(0f, h)
 
-                drawCrosshair(cx, cy, rPx, thick, thin, arm)
+                return Offset(fx, fy)
+            }
+
+            fun drawReticleAt(p: Offset) {
+                val cx = p.x
+                val cy = p.y
+
+                drawCircle(Color.Black, radius = rPx + thick, center = p)
+                drawLine(Color.Black, Offset(cx - arm, cy), Offset(cx + arm, cy), strokeWidth = thick)
+                drawLine(Color.Black, Offset(cx, cy - arm), Offset(cx, cy + arm), strokeWidth = thick)
+
+                drawCircle(Color.White, radius = rPx, center = p)
+                drawLine(Color.White, Offset(cx - arm, cy), Offset(cx + arm, cy), strokeWidth = thin)
+                drawLine(Color.White, Offset(cx, cy - arm), Offset(cx, cy + arm), strokeWidth = thin)
             }
 
             val leftStart = padPx
             val rightStart = padPx + eyePx
-            drawReticle(leftStart, +ipdShiftPx)
-            drawReticle(rightStart, -ipdShiftPx)
+
+            val lp = mapPoint(leftStart, +ipdShiftPx)
+            val rp = mapPoint(rightStart, -ipdShiftPx)
+
+            drawReticleAt(lp)
+            drawReticleAt(rp)
         }
 
-        // TUNE bar
+        // 3) TUNE 바 (TopCenter)
         Box(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -138,10 +162,11 @@ fun CardboardStreamView(
         ) {
             BasicText(
                 text = "TUNE  pad=${fmt(pad)}  ipd=${fmt(ipd)}  zoom=${fmt(zoom)}  ret=${fmt(reticleScale)}",
-                style = androidx.compose.ui.text.TextStyle(color = Color.White)
+                style = TextStyle(color = Color.White)
             )
         }
 
+        // 4) Tuning panel
         if (tuningOpen) {
             Column(
                 modifier = Modifier
@@ -153,6 +178,7 @@ fun CardboardStreamView(
             ) {
                 Text("TUNING", color = Color.White)
                 Spacer(Modifier.height(8.dp))
+
                 TuningSlider("PAD (좌우 여백)", pad, onPadChange, 0.00f, 0.20f)
                 TuningSlider("IPD (겹침 보정)", ipd, onIpdChange, -0.10f, 0.10f)
                 TuningSlider("ZOOM (확대/축소)", zoom, onZoomChange, 0.80f, 1.40f)
@@ -162,42 +188,42 @@ fun CardboardStreamView(
     }
 }
 
-private fun androidx.compose.ui.graphics.drawscope.DrawScope.drawCrosshair(
-    cx: Float, cy: Float, rPx: Float, thick: Float, thin: Float, arm: Float
-) {
-    val c = Offset(cx, cy)
-    drawCircle(Color.Black, radius = rPx + thick, center = c)
-    drawLine(Color.Black, Offset(cx - arm, cy), Offset(cx + arm, cy), strokeWidth = thick)
-    drawLine(Color.Black, Offset(cx, cy - arm), Offset(cx, cy + arm), strokeWidth = thick)
-
-    drawCircle(Color.White, radius = rPx, center = c)
-    drawLine(Color.White, Offset(cx - arm, cy), Offset(cx + arm, cy), strokeWidth = thin)
-    drawLine(Color.White, Offset(cx, cy - arm), Offset(cx, cy + arm), strokeWidth = thin)
-}
-
 @Composable
-private fun EyePane(frameBytes: ByteArray?, modifier: Modifier, zoom: Float, shiftPx: Float) {
-    if (frameBytes == null) { Box(modifier.background(Color.Black)); return }
-    val bmp = remember(frameBytes) { BitmapFactory.decodeByteArray(frameBytes, 0, frameBytes.size) }
-    if (bmp == null) { Box(modifier.background(Color.Black)); return }
+private fun EyePane(
+    img: androidx.compose.ui.graphics.ImageBitmap?,
+    modifier: Modifier,
+    zoom: Float,
+    shiftPx: Float
+) {
+    if (img == null) {
+        Box(modifier.background(Color.Black))
+        return
+    }
 
-    val shift = shiftPx.roundToInt()
+    // 주의: ContentScale.FillBounds로 “정합”을 최우선(늘어남은 감수)
     Image(
-        bitmap = bmp.asImageBitmap(),
+        bitmap = img,
         contentDescription = null,
         modifier = modifier
-            .offset { IntOffset(shift, 0) }
             .graphicsLayer {
+                clip = true
                 scaleX = zoom
                 scaleY = zoom
+                translationX = shiftPx
                 transformOrigin = TransformOrigin(0.5f, 0.5f)
             },
-        contentScale = ContentScale.Fit
+        contentScale = ContentScale.FillBounds
     )
 }
 
 @Composable
-private fun TuningSlider(title: String, value: Float, onValueChange: (Float) -> Unit, min: Float, max: Float) {
+private fun TuningSlider(
+    title: String,
+    value: Float,
+    onValueChange: (Float) -> Unit,
+    min: Float,
+    max: Float
+) {
     Text("$title : ${fmt(value)}", color = Color.White)
     Slider(
         value = value.coerceIn(min, max),
@@ -209,11 +235,73 @@ private fun TuningSlider(title: String, value: Float, onValueChange: (Float) -> 
 
 private fun fmt(v: Float): String = ((v * 100).roundToInt() / 100.0).toString()
 
-private fun jpegSize(bytes: ByteArray?): Pair<Int, Int>? {
-    if (bytes == null || bytes.isEmpty()) return null
-    return try {
-        val opt = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, opt)
-        if (opt.outWidth > 0 && opt.outHeight > 0) opt.outWidth to opt.outHeight else null
-    } catch (_: Throwable) { null }
+// ---------------- MJPEG (HttpURLConnection) ----------------
+
+@Composable
+private fun rememberMjpegFrames(url: String): State<ByteArray?> {
+    return produceState<ByteArray?>(initialValue = null, key1 = url) {
+        withContext(Dispatchers.IO) {
+            while (isActive) {
+                var conn: HttpURLConnection? = null
+                try {
+                    conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                        connectTimeout = 3000
+                        readTimeout = 0
+                        doInput = true
+                        useCaches = false
+                    }
+                    conn.connect()
+
+                    conn.inputStream.use { raw ->
+                        val input = BufferedInputStream(raw, 64 * 1024)
+                        val reader = SimpleMjpegReader(input)
+                        while (isActive) {
+                            val frame = reader.readJpegFrame() ?: break
+                            value = frame
+                        }
+                    }
+                } catch (_: Throwable) {
+                    value = null
+                    delay(300)
+                } finally {
+                    try { conn?.disconnect() } catch (_: Throwable) {}
+                }
+            }
+        }
+    }
+}
+
+private class SimpleMjpegReader(private val input: BufferedInputStream) {
+    private val buffer = ByteArray(8192)
+
+    fun readJpegFrame(): ByteArray? {
+        if (!seekToJpegStart()) return null
+
+        val out = ByteArrayOutputStream(200_000)
+        out.write(0xFF)
+        out.write(0xD8)
+
+        var prev = -1
+        while (true) {
+            val n = input.read(buffer)
+            if (n <= 0) return null
+            for (i in 0 until n) {
+                val b = buffer[i].toInt() and 0xFF
+                out.write(b)
+                if (prev == 0xFF && b == 0xD9) return out.toByteArray()
+                prev = b
+            }
+        }
+    }
+
+    private fun seekToJpegStart(): Boolean {
+        var prev = -1
+        while (true) {
+            val b = input.read()
+            if (b < 0) return false
+            val v = b and 0xFF
+            if (prev == 0xFF && v == 0xD8) return true
+            prev = v
+        }
+    }
 }

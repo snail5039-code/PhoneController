@@ -57,7 +57,7 @@ private enum class PointerSource { INDEX_TIP, PALM_CENTER }
 class MainActivity : ComponentActivity() {
 
     private val defaultPairing = PairingConfig(
-        pc = "192.168.5.5",
+        pc = "192.168.200.11",
         httpPort = 8081,
         udpPort = 39500,
         name = "PC"
@@ -130,7 +130,6 @@ class MainActivity : ComponentActivity() {
                 scanActive = scanActive,
                 onOpenPairing = { startQrScan() },
                 onSend = { x01, y01, gesture, tracking -> sendXR(x01, y01, gesture, tracking) },
-                onSendText = { text -> sendText(text) },
                 onSendKeyTap = { key -> sendKeyTap(key) }
             )
         }
@@ -144,25 +143,6 @@ class MainActivity : ComponentActivity() {
             put("pointerY", y.toDouble())
             put("gesture", gesture)
             put("tracking", tracking)
-        }.toString()
-
-        val targetPort = udpPortLive
-        netExec.execute {
-            try {
-                val s = socket ?: return@execute
-                val a = addr ?: return@execute
-                val data = msg.toByteArray(Charsets.UTF_8)
-                s.send(DatagramPacket(data, data.size, a, targetPort))
-            } catch (_: Exception) { }
-        }
-    }
-
-    private fun sendText(text: String) {
-        if (text.isBlank()) return
-        val msg = JSONObject().apply {
-            put("type", "XR_TEXT")
-            put("ts", System.currentTimeMillis())
-            put("text", text)
         }.toString()
 
         val targetPort = udpPortLive
@@ -240,7 +220,6 @@ private fun XRPadApp(
     scanActive: Boolean,
     onOpenPairing: () -> Unit,
     onSend: (Float, Float, String, Boolean) -> Unit,
-    onSendText: (String) -> Unit,
     onSendKeyTap: (String) -> Unit
 ) {
     var pointerX by remember { mutableStateOf(0.5f) }
@@ -251,14 +230,22 @@ private fun XRPadApp(
     var kbdClickPulse by remember { mutableStateOf(0L) }
     var tuningOpen by rememberSaveable { mutableStateOf(false) }
 
-    // ✅ 네 기본값
+    // 기본값
     var pad by rememberSaveable { mutableStateOf(0.15f) }
     var ipd by rememberSaveable { mutableStateOf(-0.01f) }
     var zoom by rememberSaveable { mutableStateOf(0.85f) }
     var reticleScale by rememberSaveable { mutableStateOf(1.00f) }
 
-    Box(Modifier.fillMaxSize()) {
+    // 프레임 크기(없어도 VirtualKeyboard는 동작하지만, 카드보드 보정용)
+    var srcW by remember { mutableStateOf(0) }
+    var srcH by remember { mutableStateOf(0) }
 
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(Color.Black)
+            .windowInsetsPadding(WindowInsets.systemBars)
+    ) {
         CardboardStreamView(
             streamUrl = streamUrl,
             pointerX = pointerX,
@@ -276,19 +263,17 @@ private fun XRPadApp(
             tuningOpen = tuningOpen
         )
 
-        // PAIR
         Box(
             modifier = Modifier
                 .align(Alignment.TopStart)
                 .padding(12.dp)
                 .background(Color(0xAA000000), RoundedCornerShape(12.dp))
-                .clickable { onOpenPairing() }
+                .clickable { onOpenPairing() }   // ✅ 여기 누르면 스캔 실행됨
                 .padding(horizontal = 14.dp, vertical = 10.dp)
         ) {
             BasicText("PAIR", style = TextStyle(color = Color.White, fontWeight = FontWeight.Bold))
         }
 
-        // KBD
         Box(
             modifier = Modifier
                 .align(Alignment.TopEnd)
@@ -312,7 +297,11 @@ private fun XRPadApp(
             },
             onSend = { x, y, gesture, tr ->
                 if (keyboardOn) {
-                    if (gesture == "PINCH_TAP") kbdClickPulse = System.currentTimeMillis()
+                    // 키보드 ON일 때는 핀치탭을 "키 선택"으로만 사용(PC 클릭은 CLICK 키로)
+                    if (gesture == "PINCH_TAP") {
+                        kbdClickPulse = System.currentTimeMillis()
+                        onSendKeyTap("CLICK")  // <- 이 줄 추가 (PC 포커스 클릭)
+                    }
                     onSend(x, y, "NONE", tr)
                 } else {
                     onSend(x, y, gesture, tr)
@@ -323,14 +312,16 @@ private fun XRPadApp(
 
         if (keyboardOn) {
             VirtualKeyboard(
-                modifier = Modifier.fillMaxSize(), // ✅ navigationBarsPadding 제거 (좌표 어긋남 방지)
+                modifier = Modifier.fillMaxSize(),
                 pointerX = pointerX,
                 pointerY = pointerY,
                 tracking = tracking,
                 clickPulse = kbdClickPulse,
                 pad = pad,
                 ipd = ipd,
-                onText = { onSendText(it) },
+                zoom = zoom,
+                srcW = srcW,
+                srcH = srcH,
                 onKeyTap = { onSendKeyTap(it) },
                 onClose = { keyboardOn = false }
             )
@@ -372,7 +363,6 @@ private fun HandTrackerEngine(
 
     val V_SPREAD_MIN = 0.085f
     val RIGHT_COOLDOWN_MS = 250L
-
     val OPEN_STABLE_FRAMES = 3
 
     var sendX by remember { mutableStateOf(0.5f) }
@@ -398,7 +388,6 @@ private fun HandTrackerEngine(
 
     fun clamp01(v: Float) = v.coerceIn(0f, 1f)
     fun remap(v: Float, a: Float, b: Float): Float = clamp01((v - a) / (b - a))
-    fun dist(ax: Float, ay: Float, bx: Float, by: Float): Float = hypot(ax - bx, ay - by)
 
     fun applyBoxGain(xIn: Float, yIn: Float): Pair<Float, Float> {
         var x = remap(xIn, BOX_L, BOX_R)
@@ -407,6 +396,8 @@ private fun HandTrackerEngine(
         y = clamp01(0.5f + (y - 0.5f) * GAIN)
         return x to y
     }
+
+    fun dist(ax: Float, ay: Float, bx: Float, by: Float): Float = hypot(ax - bx, ay - by)
 
     fun fingerExtended(wX: Float, wY: Float, pipX: Float, pipY: Float, tipX: Float, tipY: Float): Boolean {
         val dTip = dist(wX, wY, tipX, tipY)
@@ -468,6 +459,7 @@ private fun HandTrackerEngine(
         }
 
         val lm = r.landmarks()[0]
+
         val (px, py) = pickPointer(lm)
         val (mx0, my0) = applyBoxGain(clamp01(px), clamp01(py))
 
@@ -475,6 +467,7 @@ private fun HandTrackerEngine(
         val ny = emaY + (my0 - emaY) * EMA_ALPHA
         emaX = if (abs(nx - emaX) < DEADZONE) emaX else nx
         emaY = if (abs(ny - emaY) < DEADZONE) emaY else ny
+
         val mappedX = clamp01(emaX)
         val mappedY = clamp01(emaY)
 
@@ -496,6 +489,7 @@ private fun HandTrackerEngine(
         val mid = lm[12]
         val pinky = lm[20]
 
+        // V 우클릭 (키보드 OFF일 때만)
         val vSpread = dist(idx.x().toFloat(), idx.y().toFloat(), mid.x().toFloat(), mid.y().toFloat())
         val vSign = (indexExt && middleExt && !ringExt && !pinkyExt && vSpread > V_SPREAD_MIN)
 
@@ -509,6 +503,7 @@ private fun HandTrackerEngine(
         }
         vDown = vSign
 
+        // 키보드 토글: 엄지+새끼 홀드
         val kbdDist = dist(thumb.x().toFloat(), thumb.y().toFloat(), pinky.x().toFloat(), pinky.y().toFloat())
         val kbdNow = if (!kbdDown) (kbdDist < KBD_PINCH_ON) else (kbdDist < KBD_PINCH_OFF)
 
@@ -529,6 +524,7 @@ private fun HandTrackerEngine(
             }
         }
 
+        // 핀치 탭/드래그
         val pinchDist = dist(thumb.x().toFloat(), thumb.y().toFloat(), idx.x().toFloat(), idx.y().toFloat())
         val pinchNow = if (!pinchDown) (pinchDist < PINCH_ON) else (pinchDist < PINCH_OFF)
 
@@ -546,11 +542,14 @@ private fun HandTrackerEngine(
         } else if (!pinchNow && pinchDown) {
             val dur = now - pinchStartMs
             pinchDown = false
+
             if (dragging) {
                 dragging = false
                 sendEventNow(sendX, sendY, "PINCH_RELEASE")
             } else {
-                if (dur <= 220L) sendEventNow(sendX, sendY, "PINCH_TAP")
+                if (dur <= TAP_MAX_MS) {
+                    sendEventNow(sendX, sendY, "PINCH_TAP")
+                }
             }
             dragHoldSent = false
         }
